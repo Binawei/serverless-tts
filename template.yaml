@@ -1,0 +1,143 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Serverless TTS Application
+
+Globals:
+  Function:
+    Timeout: 300
+    Runtime: python3.9
+    Environment:
+      Variables:
+        DYNAMODB_TABLE: !Ref TTSTable
+        S3_BUCKET: !Ref TTSBucket
+        SNS_TOPIC_NAME: !GetAtt TTSTopic.TopicName
+        AWS_REGION: !Ref AWS::Region
+
+Resources:
+  # DynamoDB Table
+  TTSTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: tts-requests-local
+      AttributeDefinitions:
+        - AttributeName: reference_key
+          AttributeType: S
+      KeySchema:
+        - AttributeName: reference_key
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+
+  # S3 Bucket
+  TTSBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "tts-local-${AWS::AccountId}-${AWS::Region}"
+
+  # SNS Topic
+  TTSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: tts-processing-local
+
+  # Lambda Functions
+  UploadFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambda-functions/upload-execution/
+      Handler: lambda_function.lambda_handler
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            Path: /upload
+            Method: post
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TTSTable
+        - S3CrudPolicy:
+            BucketName: !Ref TTSBucket
+
+  DocumentSplitterFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambda-functions/document-splitter/
+      Handler: lambda_function.lambda_handler
+      Events:
+        DynamoDBStream:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt TTSTable.StreamArn
+            StartingPosition: LATEST
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TTSTable
+        - S3CrudPolicy:
+            BucketName: !Ref TTSBucket
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt TTSTopic.TopicName
+
+  PollyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambda-functions/polly-invoker/
+      Handler: lambda_function.lambda_handler
+      Events:
+        S3Event:
+          Type: S3
+          Properties:
+            Bucket: !Ref TTSBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: download/
+                  - Name: suffix
+                    Value: .txt
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TTSTable
+        - S3CrudPolicy:
+            BucketName: !Ref TTSBucket
+        - Statement:
+            - Effect: Allow
+              Action:
+                - polly:SynthesizeSpeech
+              Resource: "*"
+
+  TrackFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambda-functions/track-execution/
+      Handler: lambda_function.lambda_handler
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            Path: /track
+            Method: get
+        ApiPost:
+          Type: Api
+          Properties:
+            Path: /track
+            Method: post
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref TTSTable
+        - S3ReadPolicy:
+            BucketName: !Ref TTSBucket
+
+Outputs:
+  ApiGatewayEndpoint:
+    Description: "API Gateway endpoint URL"
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/"
+  
+  S3Bucket:
+    Description: "S3 Bucket Name"
+    Value: !Ref TTSBucket
+    
+  DynamoDBTable:
+    Description: "DynamoDB Table Name"
+    Value: !Ref TTSTable
