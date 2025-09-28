@@ -10,7 +10,7 @@ import uuid
 import jwt
 import base64
 from werkzeug.utils import secure_filename
-import PyPDF2
+# import PyPDF2  # No longer needed - using Bedrock instead
 import io
 import requests
 
@@ -120,7 +120,7 @@ def upload_text():
         # Upload to S3
         s3_key = f'audio/{reference_key}.mp3'
         s3.put_object(
-            Bucket='tts-bucket-1758733916',
+            Bucket='tts-bucket-1758893841',
             Key=s3_key,
             Body=response['AudioStream'].read(),
             ContentType='audio/mpeg'
@@ -179,7 +179,7 @@ def track_requests():
             url = s3.generate_presigned_url(
                 'get_object',
                 Params={
-                    'Bucket': 'tts-bucket-1758733916',
+                    'Bucket': 'tts-bucket-1758893841',
                     'Key': f'audio/{reference_key}.mp3'
                 },
                 ExpiresIn=3600
@@ -217,18 +217,19 @@ def upload_pdf():
         reference_key = str(uuid.uuid4())
         filename = secure_filename(file.filename)
         
-        print(f"Processing PDF: {filename} (pages {start_page}-{end_page})")
+        print(f"Processing PDF with Bedrock: {filename} (pages {start_page}-{end_page})")
         
         # Upload PDF to S3
         s3_key = f'pdfs/{reference_key}/{filename}'
+        s3_path = f's3://tts-bucket-1758893841/{s3_key}'
         s3.put_object(
-            Bucket='tts-bucket-1758733916',
+            Bucket='tts-bucket-1758893841',
             Key=s3_key,
             Body=file.read(),
             ContentType='application/pdf'
         )
         
-        # Create DynamoDB record
+        # Create DynamoDB record with S3Path for Lambda trigger
         item = {
             'reference_key': reference_key,
             'user_email': user_email,
@@ -237,6 +238,7 @@ def upload_pdf():
             'StartPage': start_page,
             'EndPage': end_page,
             'voice': voice_id,
+            'S3Path': s3_path,
             'TaskStatus': 'Upload-Completed',
             'UploadDateTime': datetime.now().isoformat(),
             'InputType': 'PDF'
@@ -244,43 +246,49 @@ def upload_pdf():
         
         table.put_item(Item=item)
         
-        # Extract text from PDF
-        file.seek(0)  # Reset file pointer
-        pdf_reader = PyPDF2.PdfReader(io.BytesIO(file.read()))
+        print(f"PDF uploaded to S3: {s3_path}")
+        print(f"DynamoDB record created - Lambda pipeline will process with Bedrock")
         
-        extracted_text = ""
-        total_pages = len(pdf_reader.pages)
+        return jsonify({
+            'reference_key': reference_key,
+            'status': 'processing',
+            'message': 'PDF uploaded successfully. Bedrock processing started.'
+        })
         
-        # Adjust end_page if it exceeds total pages
-        actual_end_page = min(end_page, total_pages)
+    except Exception as e:
+        print(f"PDF upload error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/process-bedrock-text', methods=['POST'])
+def process_bedrock_text():
+    """Process extracted text from Bedrock and generate audio"""
+    try:
+        data = request.json
+        reference_key = data['reference_key']
         
-        for page_num in range(start_page - 1, actual_end_page):
-            if page_num < total_pages:
-                page = pdf_reader.pages[page_num]
-                extracted_text += page.extract_text() + " "
+        # Get the extracted text from S3
+        text_key = f'download/{reference_key}/formatted_output.txt'
         
-        # Clean up text
-        extracted_text = extracted_text.strip()
-        if not extracted_text:
-            extracted_text = f"No readable text found in {filename} pages {start_page}-{actual_end_page}. The PDF might contain images or scanned content."
+        try:
+            response = s3.get_object(Bucket='tts-bucket-1758893841', Key=text_key)
+            extracted_text = response['Body'].read().decode('utf-8')
+        except Exception as e:
+            return jsonify({'error': f'Text not found: {str(e)}'}), 404
         
-        print(f"Extracted {len(extracted_text)} characters from PDF")
-        print(f"Text preview: {extracted_text[:100]}...")
+        # Get voice settings from DynamoDB
+        item = table.get_item(Key={'reference_key': reference_key})['Item']
+        voice_id = item.get('voice', 'Joanna')
         
-        # Store extracted text in DynamoDB
-        table.update_item(
-            Key={'reference_key': reference_key},
-            UpdateExpression='SET extracted_text = :text',
-            ExpressionAttributeValues={':text': extracted_text}
-        )
+        print(f"Generating audio for Bedrock-extracted text: {len(extracted_text)} characters")
         
-        print(f"Generating audio for PDF: {reference_key}")
+        # Limit text length for Polly (max 3000 characters)
+        text_for_polly = extracted_text[:3000] if len(extracted_text) > 3000 else extracted_text
         
-        # Generate audio with Polly (limit text length)
-        text_for_audio = extracted_text[:3000] if len(extracted_text) > 3000 else extracted_text
-        
+        # Generate audio with Polly
         response = polly.synthesize_speech(
-            Text=text_for_audio,
+            Text=text_for_polly,
             OutputFormat='mp3',
             VoiceId=voice_id
         )
@@ -288,31 +296,32 @@ def upload_pdf():
         # Upload audio to S3
         audio_key = f'audio/{reference_key}.mp3'
         s3.put_object(
-            Bucket='tts-bucket-1758733916',
+            Bucket='tts-bucket-1758893841',
             Key=audio_key,
             Body=response['AudioStream'].read(),
             ContentType='audio/mpeg'
         )
         
-        print(f"PDF audio uploaded to S3: {audio_key}")
-        
-        # Update status
+        # Update status to Voice-Ready
         table.update_item(
             Key={'reference_key': reference_key},
-            UpdateExpression='SET TaskStatus = :status',
-            ExpressionAttributeValues={':status': 'Voice-is-Ready'}
+            UpdateExpression='SET TaskStatus = :status, extracted_text = :text',
+            ExpressionAttributeValues={
+                ':status': 'Voice-is-Ready',
+                ':text': extracted_text
+            }
         )
         
-        print(f"PDF conversion complete: {reference_key}")
+        print(f"Bedrock-to-audio conversion complete: {reference_key}")
         
         return jsonify({
             'reference_key': reference_key,
             'status': 'success',
-            'message': 'PDF uploaded and converted successfully'
+            'text_length': len(extracted_text)
         })
         
     except Exception as e:
-        print(f"PDF upload error: {e}")
+        print(f"Bedrock text processing error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/auth/oauth-callback', methods=['POST'])
