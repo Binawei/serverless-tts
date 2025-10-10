@@ -11,7 +11,7 @@ React frontend + AWS Lambda backend for text-to-speech conversion.
 - **Events**: SNS + DynamoDB Streams
 
 ## Architecture
-![Architecture Diagram](/images/architecture.png)
+![Architecture Diagram](images/architecture.png)
 
 ### Architecture Walkthrough
 
