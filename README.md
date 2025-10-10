@@ -10,6 +10,23 @@ React frontend + AWS Lambda backend for text-to-speech conversion.
 - **Storage**: S3 + DynamoDB
 - **Events**: SNS + DynamoDB Streams
 
+## Architecture
+![Architecture Diagram](./images/architecture.png)
+
+### Architecture Walkthrough
+
+1. During `terraform apply` deployment, assets are uploaded to the build artifacts Simple Storage Service (S3) bucket.
+2. An AWS Lambda function triggers an AWS CodeBuild project that builds the container image for the Document Splitter function and stores it in the Amazon Elastic Container Registry (ECR).
+3. The Document Splitter AWS Lambda function is deployed using the image from ECR.
+4. After deployment, a user loads the website via the Amazon CloudFront domain url, which serves the static website content from the associated Amazon S3 bucket.
+5. The user authenticates via Amazon Cognito and receives temporary credentials for interacting with the service AWS Lambda functions.
+6. Via the website UI, the user uploads a PDF document to the Upload Execution AWS Lambda function. It creates a job entry in the Amazon DynamoDB table and stores the PDF in the Document Data Amazon S3 bucket.
+7. The new job entry in the Amazon DynamoDB table is processed by the associated DynamoDB Stream which triggers the Document Splitter function. It converts the pages of the document it got from the Amazon S3 bucket to images, stores them back in it, updates the job status in the Amazon DynamoDB table and sends a notification to an Amazon Simple Notification Service (SNS) topic.
+8. The Image To Text AWS Lambda function is subscribed to the SNS topic and triggered with the notification. It uses Amazon Bedrock to extract the text from the images it got from the Amazon S3 bucket and puts the result back into it.
+9. An Amazon S3 event notification triggers the Text To Voice AWS Lambda function which gets the text file from the bucket, uses Amazon Polly to convert it to an audio file in MP3 format and stores it back in the bucket.
+10. Navigating to the Existing Requests page in the UI, the website triggers the Track Execution AWS Lambda function. It lists all jobs including their current status and provides pre-signed URLs for the audio files of the finished jobs for downloading the MP3 files and playing them directly in supported browsers.
+
+
 ## AWS Services Required
 - Lambda Functions (4)
 - DynamoDB Table + Streams
